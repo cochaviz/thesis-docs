@@ -1,0 +1,247 @@
+// slides
+#import "@preview/grape-suite:3.1.0": slides
+#import slides: *
+
+// fancy codly stuff
+#import "@preview/codly:1.3.0": *
+#import "@preview/codly-languages:0.1.1": *
+#show: codly-init.with()
+#codly(languages: codly-languages)
+
+// tick boxes
+#import "@preview/cheq:0.3.0": checklist
+#show: checklist
+
+// customization
+#show heading: it => {
+  pagebreak()
+  it
+}
+
+#show figure.caption: set text(20pt)
+#show figure: set align(center + horizon)
+#show raw: set text(15pt)
+
+#show: slides.with(
+  title: [Toward A Consolidated Botnet Analysis Pipeline],
+  author: "Zohar Cochavi",
+  show-date: false,
+  show-semester: false,
+  no: 9,
+)
+
+
+= Research Question
+
+#align(
+  left + horizon,
+  quote(block: true)[_
+  "How can we infer IoT botnet DDoS attack targets, DDoS attack methods, infection
+  targets, and infection methods from sandboxed network traffic alone while
+  restricting allowed communications to the C2 server?"_],
+)
+
+
+== Subquestions
+
+- [?] _RQ1_: What traffic features (flow metadata, timing/periodicity, header
+  semantics, inter-flow correlations) best distinguish common IoT DDoS attack
+  types?
+- [-] _RQ2_: How can we allow just C2 network traffic while capturing and
+  sinkholing non-C2 traffic to avoid collateral damage?
+- [?] _RQ3_: How accurate is DDoS attack target and DDoS attack kind extraction?
+- [ ] _RQ4_: What features distinguish spreading behavior from DDoS attacking behavior?
+
+
+= Previously On...
+
+Clearly:
+
+- [-] Run long-running samples until something interesting happens (by hand for now?)
+
+But also use collected data to start answering RQ1 (DDoS attack type detection):
+
+- [ ] Investigate last attack for potential features
+- [ ] Find methods for the data analysis (hopefully within Elastic, start with
+  basic KNN clustering?)
+- [ ] C2 Server TAXII Feed?!!?
+
+== Why like this
+
+The right approach was to collect a bunch of data, then do analysis later.
+
+With that in mind:
+
+- [x] Deploy on TUD VMs
+- [x] Ensure event-based PCAP logging
+
+= Current Deployment
+
+I've deployed my stack on the TUD VMs (if you want access, let me know!):
+
+- `tud-01`/`145.220.183.14`: ELK Stack
+- `tud-02`/`145.220.183.19`: Sandbox
+
+To be clear:
+
+- `tud-02` runs the `talkbox` Python tool to execute samples, using various
+  scripts to set up the environment and pass through traffic.
+- All new code is written in Go. This includes my improved version of `talkbox` which I only work on sometimes in my spare time.
+
+== Some Changes
+
+Some changes compared to the last deployment:
+
+- No flow logging in long-running samples (only alerts and DNS)
+- Suricata logging on the Sandbox host to allow for investigation if anything goes
+  wrong
+- Detection and surpression of scanning samples to avoid alert flooding.
+
+= Suricata :(
+
+
+The use-case was simple enough: Trigger alerts on certain traffic patterns, dump PCAPs when they occur.
+
+- Use xbit to indicate that certain rules have triggered.
+- Use thresholding to avoid alert floods.
+- Use tagging to dump packets when an alert is triggered.
+
+However, Suricata's xbit and thresholding features are broken in various ways.
+
+#pagebreak()
+#figure(
+  ```rules
+  alert udp $HOME_NET any -> !$HOME_NET any (
+    msg:"mark dst: high UDP packet rate (30s)";
+    flow:to_server,stateless;
+    detection_filter: track by_dst, count 150000, seconds 30;
+    xbits:set, single_high_flow, track ip_dst, expire 30;
+    noalert;
+    sid:1000102; rev:2;
+  )
+  ```,
+  caption: [Rules that are supposed to set an `xbit` for destinations which
+    receive a high rate of UDP packets.],
+)
+
+#pagebreak()
+#figure(
+  ```rules
+  alert ip $HOME_NET any -> !$HOME_NET any (
+    msg:"DDoS: destination under high packet rate (hot dst)";
+    xbits:isset, single_high_flow, track ip_dst;
+    threshold: type limit, track by_dst, count 1, seconds 30;
+    tag:host,100,packets,dst; # keep the current + next 100 packets
+    classtype:attempted-dos;
+    sid:1000103; rev:3;
+  )
+  ```,
+  caption: [Rules that are supposed to trigger when the `xbit` is set, and tag
+    packets for dumping.],
+)
+
+== Why It's Broken
+
+Unfortunately, Suricata's xbit setting and checking is broken in various ways:
+
+- The thresholding is only applied to the alert that is raised, meaning that the
+  xbit is set for every single packet that matches the first rule
+- This is also what happens when we use tagging -- every packet that matches the
+  second rule is tagged, regardless of whether the threshold has been exceeded
+
+On to Plan B: Go back to our own implementation.
+
+= Go :)
+
+I've gone back to the PoC I was working on for network detection, and added:
+
+- Better logging
+- Per-host packet rate tracking and alerting
+- PCAP dumping on alert
+
+The tool that generates the DoS traffic is called `godos` and the monitoring is
+called `gomon`!
+
+== Examples
+
+Some examples of scanning and attack alerts generated by `gomon`. The data for
+each is generated by `godos` running in a sandboxed VM.
+
+1. First, we ran `synflood_high` (50000 packets/s) against `100.100.100.100`.
+2. Then, we ran `scan_unique_ips` (300 packets/s) against random IPs.
+
+For each alert, we save a PCAP of the traffic during the window (30 seconds),
+keeping the newest packets. Currently set to 50 packets:
+
+```bash
+gomon synflood_high.pcap 10.13.37.109 --output records.jsonl --save-packets 50
+```
+
+#pagebreak()
+#figure(
+  ```json
+  {
+      "time": "2025-11-06T10:36:20.399347+01:00",
+      "level": "INFO",
+      "msg": "Detected an attack",
+      "type": "event",
+      "classification": "attack",
+      "scope": "local",
+      "@timestamp": "2025-10-23T11:22:36.348563+02:00",
+      "packet_rate": 58121.933333333334,
+      "packet_threshold": 5,
+      "src_ip": "10.13.37.109",
+      "dst_ip": "100.100.100.100"
+  }
+  ```,
+)
+
+#pagebreak()
+#figure(
+  ```json
+  {
+      "time": "2025-11-06T10:34:28.505231+01:00",
+      "level": "INFO",
+      "msg": "Detected a scan",
+      "type": "event",
+      "classification": "scanning",
+      "scope": "global",
+      "@timestamp": "2025-10-22T16:41:02.39798+02:00",
+      "packet_rate": 376.2,
+      "packet_threshold": 5,
+      "ip_rate": 375.46666666666664,
+      "ip_rate_threshold": 10,
+      "src_ip": "10.13.37.145"
+  }
+  ```,
+)
+
+== Dumped Data
+
+#figure(
+  image("assets/image.png", height: 89%),
+)
+
+
+= Running Samples
+
+I've started running samples yesterday and I was getting a lot of scanning
+samples (more than 200 unique destinations in 30s):
+
+- We can't extract C2 Server when this happens
+- Kind of starts overflowing ELK which is annoying
+
+This is annoying, but also reflective of how we want to be able to determine the
+C2 server in active samples.
+
+= Next On..
+
+Of course:
+
+- [ ] Run long-running samples until something interesting happens (by hand for now!)
+- [ ] Replace Suricata alerting with `gomon` in the sandbox environment.
+
+But also:
+
+- [ ] Add C2 detection functionality in `gomon` to formalize RQ2 (ideally, this
+  would also work in the context of long-running samples).
